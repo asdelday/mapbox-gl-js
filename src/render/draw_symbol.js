@@ -1,5 +1,6 @@
 'use strict';
 
+const assert = require('assert');
 const browser = require('../util/browser');
 const drawCollisionDebug = require('./draw_collision_debug');
 const pixelsToTileUnits = require('../source/pixels_to_tile_units');
@@ -37,16 +38,14 @@ function drawSymbols(painter, sourceCache, layer, coords) {
         layer.layout['icon-rotation-alignment'],
         // icon-pitch-alignment is not yet implemented
         // and we simply inherit the rotation alignment
-        layer.layout['icon-rotation-alignment'],
-        layer.layout['icon-size']
+        layer.layout['icon-rotation-alignment']
     );
 
     drawLayerSymbols(painter, sourceCache, layer, coords, true,
         layer.paint['text-translate'],
         layer.paint['text-translate-anchor'],
         layer.layout['text-rotation-alignment'],
-        layer.layout['text-pitch-alignment'],
-        layer.layout['text-size']
+        layer.layout['text-pitch-alignment']
     );
 
     if (sourceCache.map.showCollisionBoxes) {
@@ -55,7 +54,7 @@ function drawSymbols(painter, sourceCache, layer, coords) {
 }
 
 function drawLayerSymbols(painter, sourceCache, layer, coords, isText, translate, translateAnchor,
-        rotationAlignment, pitchAlignment, size) {
+        rotationAlignment, pitchAlignment) {
 
     if (!isText && painter.style.sprite && !painter.style.sprite.loaded())
         return;
@@ -90,8 +89,7 @@ function drawLayerSymbols(painter, sourceCache, layer, coords, isText, translate
             program = painter.useProgram(isSDF ? 'symbolSDF' : 'symbolIcon', programConfiguration);
             programConfiguration.setUniforms(gl, program, layer, {zoom: painter.transform.zoom});
 
-            setSymbolDrawState(program, painter, isText, isSDF, rotateWithMap, pitchWithMap, bucket.fontstack, size,
-                    bucket.iconsNeedLinear, isText ? bucket.adjustedTextSize : bucket.adjustedIconSize);
+            setSymbolDrawState(program, painter, layer, coord.z, isText, isSDF, rotateWithMap, pitchWithMap, bucket.fontstack, bucket.iconsNeedLinear);
         }
 
         painter.enableTileClippingMask(coord);
@@ -99,8 +97,8 @@ function drawLayerSymbols(painter, sourceCache, layer, coords, isText, translate
         gl.uniformMatrix4fv(program.u_matrix, false,
                 painter.translatePosMatrix(coord.posMatrix, tile, translate, translateAnchor));
 
-        drawTileSymbols(program, painter, layer, tile, buffers, isText, isSDF,
-                pitchWithMap, size);
+        drawTileSymbols(program, programConfiguration, painter, layer, tile, buffers, isText, isSDF,
+                pitchWithMap);
 
         prevFontstack = bucket.fontstack;
     }
@@ -108,8 +106,7 @@ function drawLayerSymbols(painter, sourceCache, layer, coords, isText, translate
     if (!depthOn) gl.enable(gl.DEPTH_TEST);
 }
 
-function setSymbolDrawState(program, painter, isText, isSDF, rotateWithMap, pitchWithMap, fontstack, size,
-        iconsNeedLinear, adjustedSize) {
+function setSymbolDrawState(program, painter, layer, tileZoom, isText, isSDF, rotateWithMap, pitchWithMap, fontstack, iconsNeedLinear) {
 
     const gl = painter.gl;
     const tr = painter.transform;
@@ -119,6 +116,8 @@ function setSymbolDrawState(program, painter, isText, isSDF, rotateWithMap, pitc
 
     gl.activeTexture(gl.TEXTURE0);
     gl.uniform1i(program.u_texture, 0);
+
+    gl.uniform1f(program.u_is_text, isText ? 1 : 0);
 
     if (isText) {
         // use the fonstack used when parsing the tile, not the fontstack
@@ -130,7 +129,10 @@ function setSymbolDrawState(program, painter, isText, isSDF, rotateWithMap, pitc
         gl.uniform2f(program.u_texsize, glyphAtlas.width / 4, glyphAtlas.height / 4);
     } else {
         const mapMoving = painter.options.rotating || painter.options.zooming;
-        const iconScaled = size !== 1 || browser.devicePixelRatio !== painter.spriteAtlas.pixelRatio || iconsNeedLinear;
+        const iconSizeScaled = !layer.isLayoutValueFeatureConstant('text-size') ||
+            !layer.isLayoutValueZoomConstant('text-size') ||
+            layer.getLayoutValue('text-size', { zoom: tr.zoom }, {}) !== 1;
+        const iconScaled = iconSizeScaled || browser.devicePixelRatio !== painter.spriteAtlas.pixelRatio || iconsNeedLinear;
         const iconTransformed = pitchWithMap || tr.pitch;
         painter.spriteAtlas.bind(gl, isSDF || mapMoving || iconScaled || iconTransformed);
         gl.uniform2f(program.u_texsize, painter.spriteAtlas.width / 4, painter.spriteAtlas.height / 4);
@@ -141,35 +143,61 @@ function setSymbolDrawState(program, painter, isText, isSDF, rotateWithMap, pitc
     gl.uniform1i(program.u_fadetexture, 1);
 
     // adjust min/max zooms for variable font sizes
-    const zoomAdjust = Math.log(size / adjustedSize) / Math.LN2 || 0;
-    gl.uniform1f(program.u_zoom, (tr.zoom - zoomAdjust) * 10); // current zoom level
+    gl.uniform1f(program.u_zoom, tr.zoom);
 
     gl.uniform1f(program.u_pitch, tr.pitch / 360 * 2 * Math.PI);
     gl.uniform1f(program.u_bearing, tr.bearing / 360 * 2 * Math.PI);
     gl.uniform1f(program.u_aspect_ratio, tr.width / tr.height);
 }
 
-function drawTileSymbols(program, painter, layer, tile, buffers, isText, isSDF,
-        pitchWithMap, size) {
+function drawTileSymbols(program, programConfiguration, painter, layer, tile, buffers, isText, isSDF,
+        pitchWithMap) {
 
     const gl = painter.gl;
     const tr = painter.transform;
 
-    const fontScale = size / (isText ? 24 : 1);
+    // If {text,icon}-size is a composite function, the shader needs to
+    // evaluate it at the zoom level that was used at *layout* time, which
+    // is distinct the current *rendered* zoom level.
+    const sizeProperty = isText ? 'text-size' : 'icon-size';
+    const isSizeCompositeFunction =
+        !layer.isLayoutValueZoomConstant(sizeProperty) &&
+        !layer.isLayoutValueFeatureConstant(sizeProperty);
+    gl.uniform1f(program.u_is_size_composite, isSizeCompositeFunction ? 1 : 0);
+
+    const layoutZoom = tile.coord.z + 1;
+    if (isSizeCompositeFunction) {
+        // Reproduce the ProgramConfiguration logic to provide the shader with
+        // an interpolation "t" value corresponding to the layout zoom level.
+        // (see ProgramConfiguration#addZoomAndPropertyAttribute.)
+        let stopOffset;
+        for (const uniform of programConfiguration.interpolationUniforms) {
+            if (uniform.property === sizeProperty) stopOffset = uniform.stopOffset;
+        }
+        assert(typeof stopOffset === 'number');
+        const stopInterp = layer.getLayoutInterpolationT(sizeProperty, { zoom: layoutZoom });
+        const interpolationT = Math.max(0, Math.min(3, stopInterp - stopOffset));
+        gl.uniform1f(program.u_adjusted_size_t, interpolationT);
+    } else {
+        gl.uniform1f(program.u_adjusted_size,
+            layer.getLayoutValue(sizeProperty, { zoom: layoutZoom })
+        );
+    }
 
     if (pitchWithMap) {
-        const s = pixelsToTileUnits(tile, fontScale, tr.zoom);
+        const s = pixelsToTileUnits(tile, 1, tr.zoom);
         gl.uniform2f(program.u_extrude_scale, s, s);
     } else {
-        const s = tr.cameraToCenterDistance * fontScale;
-        gl.uniform2f(program.u_extrude_scale, tr.pixelsToGLUnits[0] * s, tr.pixelsToGLUnits[1] * s);
+        const s = tr.cameraToCenterDistance;
+        gl.uniform2f(program.u_extrude_scale,
+            tr.pixelsToGLUnits[0] * s,
+            tr.pixelsToGLUnits[1] * s);
     }
 
     if (isSDF) {
         const haloWidthProperty = `${isText ? 'text' : 'icon'}-halo-width`;
         const hasHalo = !layer.isPaintValueFeatureConstant(haloWidthProperty) || layer.paint[haloWidthProperty];
-        const gammaScale = fontScale * (pitchWithMap ? Math.cos(tr._pitch) : 1) * tr.cameraToCenterDistance;
-        gl.uniform1f(program.u_font_scale, fontScale);
+        const gammaScale = (isText ? 1 / 24 : 1) * (pitchWithMap ? Math.cos(tr._pitch) : 1) * tr.cameraToCenterDistance;
         gl.uniform1f(program.u_gamma_scale, gammaScale);
 
         if (hasHalo) { // Draw halo underneath the text.
